@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#1B2A4A" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="シフト" />
+  <title>シフトカレンダー</title>
+  <link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect width='512' height='512' rx='100' fill='%231B2A4A'/%3E%3Crect x='80' y='120' width='352' height='300' rx='28' fill='none' stroke='%234A90D9' stroke-width='22'/%3E%3Crect x='80' y='120' width='352' height='95' rx='28' fill='%234A90D9'/%3E%3Crect x='174' y='72' width='32' height='100' rx='16' fill='%237EC8E3'/%3E%3Crect x='306' y='72' width='32' height='100' rx='16' fill='%237EC8E3'/%3E%3Crect x='128' y='272' width='60' height='22' rx='11' fill='%234A90D9'/%3E%3Crect x='226' y='272' width='60' height='22' rx='11' fill='%234A90D9'/%3E%3Crect x='324' y='272' width='60' height='22' rx='11' fill='%234A90D9'/%3E%3Crect x='128' y='334' width='60' height='22' rx='11' fill='%234A90D9'/%3E%3Crect x='226' y='334' width='60' height='22' rx='11' fill='%23F0C040'/%3E%3Crect x='324' y='334' width='60' height='22' rx='11' fill='%234A90D9'/%3E%3C/svg%3E" />
+  <style>*, *::before, *::after{box-sizing:border-box;margin:0;padding:0;}body{font-family:system-ui,sans-serif;background:#F4F6F9;color:#1A1A2E;}</style>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+  <script type="text/babel">
+const {useState,useCallback,useEffect}=React;
+const STORAGE_KEY="shiftCalendarData_v1";
+const SETTINGS_KEY="shiftCalendarSettings_v1";
+
+function timeToMin(t){const[h,m]=t.split(":").map(Number);return h*60+m;}
+function fmtDur(m){if(m<=0)return"0h";const h=Math.floor(m/60),min=m%60;return min===0?`${h}h`:`${h}h${String(min).padStart(2,"0")}m`;}
+function fmtBreak(m){if(m<=0)return"0m";const h=Math.floor(m/60),min=m%60;if(h===0)return`${min}m`;return min===0?`${h}h`:`${h}h${String(min).padStart(2,"0")}m`;}
+function parseDuration(str){const hm=str.match(/^(\d+)h(\d+)$/);if(hm)return parseInt(hm[1])*60+parseInt(hm[2]);const ho=str.match(/^(\d+(?:\.\d+)?)h$/);if(ho)return Math.round(parseFloat(ho[1])*60);const n=parseFloat(str);if(!isNaN(n))return Math.round(n*60);return 0;}
+function isOff(sd,key){const d=sd[key];return!d||d.isOff||d.shifts.length===0;}
+function dateToKey(date){return`${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,"0")}-${String(date.getDate()).padStart(2,"0")}`;}
+function keyToDate(key){const[y,m,d]=key.split("-").map(Number);return new Date(y,m-1,d,12);}
+function keyToLabel(key){if(!key)return"";const[y,m,d]=key.split("-").map(Number);return`${m}/${d}(${["日","月","火","水","木","金","土"][new Date(y,m-1,d).getDay()]})`;}
+function calcStreak(sd,targetKey,overrideIsWork){
+  const iw=(key)=>key===targetKey?(overrideIsWork!==null?overrideIsWork:!isOff(sd,key)):!isOff(sd,key);
+  if(!iw(targetKey))return 0;
+  const target=keyToDate(targetKey);let streak=1;
+  for(let i=1;i<=31;i++){const d=new Date(target);d.setDate(d.getDate()-i);const k=dateToKey(d);if(sd[k]===undefined||!iw(k))break;streak++;}
+  for(let i=1;i<=31;i++){const d=new Date(target);d.setDate(d.getDate()+i);const k=dateToKey(d);if(sd[k]===undefined||!iw(k))break;streak++;}
+  return streak;
+}
+function getShiftCutoff(ov){
+  if(ov.earlyLeave&&ov.earlyLeaveTime)return timeToMin(ov.earlyLeaveTime);
+  if(ov.leaveEarly&&ov.leaveEarlyTime)return timeToMin(ov.leaveEarlyTime);
+  return null;
+}
+function calcDayTimes(dayData){
+  if(!dayData||dayData.isOff||!dayData.shifts.length)return{constraintMin:0,breakMin:0,workMin:0,earlyLeaveWorkMin:0};
+  const ov=dayData.override||{};
+  if(ov.absent)return{constraintMin:0,breakMin:0,workMin:0,earlyLeaveWorkMin:0};
+  const cutoff=getShiftCutoff(ov);
+  const isEarlyLeave=!!(ov.earlyLeave&&ov.earlyLeaveTime);
+  let constraintMin=0,breakMin=0,earlyLeaveWorkMin=0;
+  for(const sh of dayData.shifts){
+    const start=timeToMin(sh.start),end=timeToMin(sh.end);
+    let effectiveEnd=end;
+    if(cutoff!==null){if(cutoff>start&&cutoff<end)effectiveEnd=cutoff;else if(cutoff<=start)continue;}
+    constraintMin+=effectiveEnd-start;
+    for(const b of sh.breaks){const bs=timeToMin(b.start),be=timeToMin(b.end);if(bs<effectiveEnd)breakMin+=Math.min(be,effectiveEnd)-bs;}
+    if(isEarlyLeave&&cutoff!==null&&cutoff>start&&cutoff<end){
+      const shBreak=sh.breaks.reduce((s,b)=>s+(timeToMin(b.end)-timeToMin(b.start)),0);
+      earlyLeaveWorkMin+=Math.max(0,end-cutoff-(shBreak-Math.min(shBreak,cutoff-start)));
+    }
+  }
+  return{constraintMin,breakMin,workMin:Math.max(0,constraintMin-breakMin),earlyLeaveWorkMin};
+}
+function calcDayWage(dayData,hourlyWage,earlyLeaveRate){
+  if(!hourlyWage||hourlyWage<=0)return 0;
+  if(!dayData||dayData.isOff||!dayData.shifts.length)return 0;
+  const ov=dayData.override||{};
+  if(ov.absent)return 0;
+  const cutoff=getShiftCutoff(ov);
+  const isEarlyLeave=!!(ov.earlyLeave&&ov.earlyLeaveTime);
+  let total=0;
+  for(const sh of dayData.shifts){
+    const start=timeToMin(sh.start),end=timeToMin(sh.end);
+    const shBreak=sh.breaks.reduce((s,b)=>s+(timeToMin(b.end)-timeToMin(b.start)),0);
+    const shWork=end-start-shBreak;
+    if(cutoff===null){total+=hourlyWage*(shWork/60);}
+    else{
+      if(cutoff<=start)continue;
+      const effEnd=Math.min(cutoff,end);
+      const nw=Math.max(0,effEnd-start-shBreak);
+      if(isEarlyLeave){const rw=Math.max(0,shWork-nw);total+=hourlyWage*(nw/60)+hourlyWage*(earlyLeaveRate/100)*(rw/60);}
+      else{total+=hourlyWage*(nw/60);}
+    }
+  }
+  return Math.floor(total);
+}
+function loadSettings(){try{const s=localStorage.getItem(SETTINGS_KEY);return s?JSON.parse(s):{eventName:"",hourlyWage:"",showWage:true,earlyLeaveRate:60};}catch{return{eventName:"",hourlyWage:"",showWage:true,earlyLeaveRate:60};}}
+function saveSettings(s){try{localStorage.setItem(SETTINGS_KEY,JSON.stringify(s));}catch{}}
+
+function pad2(n){return String(n).padStart(2,"0");}
+function downloadICS(sd,year,month,eventName){
+  const prefix=`${year}-${String(month).padStart(2,"0")}`;
+  const entries=Object.entries(sd).filter(([k])=>k.startsWith(prefix)).sort(([a],[b])=>a.localeCompare(b));
+  const lines=["BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//ShiftCalendar//JA","CALSCALE:GREGORIAN","METHOD:PUBLISH","X-WR-CALNAME:シフト","X-WR-TIMEZONE:Asia/Tokyo"];
+  let uid=1;
+  for(const [key,day] of entries){
+    if(day.isOff||!day.shifts.length||(day.override&&day.override.absent))continue;
+    for(const sh of day.shifts){
+      const[ky,km,kd]=key.split("-").map(Number);const[sh_h,sh_m]=sh.start.split(":").map(Number);const[eh,em]=sh.end.split(":").map(Number);
+      const summary=eventName||(sh.notes.length>0?sh.notes[0]:"勤務");
+      const escS=(s)=>s.replace(/\\/g,"\\\\").replace(/;/g,"\\;").replace(/,/g,"\\,");
+      lines.push("BEGIN:VEVENT",`UID:shift-${key}-${uid++}@shiftcal`,`DTSTART;TZID=Asia/Tokyo:${ky}${pad2(km)}${pad2(kd)}T${pad2(sh_h)}${pad2(sh_m)}00`,`DTEND;TZID=Asia/Tokyo:${ky}${pad2(km)}${pad2(kd)}T${pad2(eh)}${pad2(em)}00`,`SUMMARY:${escS(summary)}`,"END:VEVENT");
+    }
+  }
+  lines.push("END:VCALENDAR");
+  const a=document.createElement("a");a.href="data:text/calendar;charset=utf-8,"+encodeURIComponent(lines.join("\r\n"));a.download=`shift_${year}${pad2(month)}.ics`;document.body.appendChild(a);a.click();document.body.removeChild(a);
+}
+function parseShift(text){
+  const lines=text.split("\n");const result={};let cur=null;
+  const dateRe=/^(\d{1,2})\/(\d{1,2})\s*\(([A-Za-z]+)\)/;
+  const timeRe=/^(\s+)(\d{1,2}:\d{2})-(\d{1,2}:\d{2})\s*\(([^)]+)\)/;
+  const breakRe=/^\s+\[休\d*\]\s+(\d{1,2}:\d{2})-(\d{1,2}:\d{2})/;
+  const offRe=/^\s+----/;
+  const DOW_EN=["Su","Mo","Tu","We","Th","Fr","Sa"];
+  for(const raw of lines){
+    const line=raw.trimEnd();if(!line.trim())continue;
+    const dm=line.match(dateRe);
+    if(dm){
+      const mo=parseInt(dm[1]),day=parseInt(dm[2]),dow=dm[3],year=new Date().getFullYear();
+      const key=`${year}-${String(mo).padStart(2,"0")}-${String(day).padStart(2,"0")}`;
+      // Fill gap days between previous date and this date as isOff
+      if(cur){
+        const prev=new Date(cur);const next=new Date(year,mo-1,day,12);
+        for(let d=new Date(prev);d<next;d.setDate(d.getDate()+1)){
+          const k=dateToKey(d);
+          if(k!==cur&&!result[k]){
+            result[k]={month:d.getMonth()+1,day:d.getDate(),dow:DOW_EN[d.getDay()],shifts:[],isOff:true,override:{}};
+          }
+        }
+      }
+      cur=key;result[key]={month:mo,day,dow,shifts:[],isOff:false,override:{}};continue;
+    }
+    if(!cur)continue;
+    if(offRe.test(line)){result[cur].isOff=true;continue;}
+    const bm=line.match(breakRe);if(bm){const s=result[cur].shifts;if(s.length)s[s.length-1].breaks.push({start:bm[1],end:bm[2]});continue;}
+    const tm=line.match(timeRe);if(tm){result[cur].shifts.push({start:tm[2],end:tm[3],minutes:parseDuration(tm[4].trim()),breaks:[],notes:[]});continue;}
+    if(/^\s+\S/.test(line)){const s=result[cur].shifts;if(s.length)s[s.length-1].notes.push(line.trim());}
+  }
+  return result;
+}
+
+const DOW_JP={Mo:"月",Tu:"火",We:"水",Th:"木",Fr:"金",Sa:"土",Su:"日"};
+
+function TimelineBar({shift}){
+  const startMin=timeToMin(shift.start),span=timeToMin(shift.end)-startMin;
+  return(<div style={{height:6,background:"#E2E8F0",borderRadius:4,position:"relative",overflow:"hidden",margin:"4px 0"}}>
+    <div style={{position:"absolute",inset:0,background:"linear-gradient(90deg,#4A90D9,#6DB8F0)",borderRadius:4}}/>
+    {shift.breaks.map((b,i)=>{const l=((timeToMin(b.start)-startMin)/span*100).toFixed(1),w=((timeToMin(b.end)-timeToMin(b.start))/span*100).toFixed(1);return<div key={i} style={{position:"absolute",top:0,bottom:0,left:`${l}%`,width:`${w}%`,background:"rgba(255,255,255,0.75)"}}/>;})}</div>);
+}
+
+function DayCard({data,todayKey,onClick,wage,earlyLeaveRate}){
+  const{day,dow,shifts,isOff:dayIsOff,override={}}=data;
+  const isSat=["Sa","Sat"].includes(dow),isSun=["Su","Sun"].includes(dow);
+  const absent=override.absent;
+  const dayOff=absent||dayIsOff||shifts.length===0;
+  const{breakMin,workMin,earlyLeaveWorkMin}=calcDayTimes(data);
+  const hasFullBreak=breakMin>=60;
+  const isToday=data._key===todayKey;
+  const isEarlyLeave=!absent&&!!(override.earlyLeave&&override.earlyLeaveTime);
+  const isLeaveEarly=!absent&&!!(override.leaveEarly&&override.leaveEarlyTime);
+  const dailyWage=wage>0?calcDayWage(data,wage,earlyLeaveRate):0;
+  return(
+    <div onClick={onClick} style={{background:"white",borderRadius:12,boxShadow:isToday?"0 0 0 2px #4A90D9,0 4px 16px rgba(74,144,217,0.2)":"0 2px 12px rgba(27,42,74,0.08)",overflow:"hidden",borderLeft:`4px solid ${absent?"#E85D4A":isEarlyLeave?"#F0C040":isLeaveEarly?"#7A5AF8":isToday?"#4A90D9":dayOff?"#CBD5E0":"#4A90D9"}`,cursor:"pointer"}}>
+      <div style={{display:"flex",alignItems:"center",padding:"10px 14px",background:absent?"#FFF0EE":isToday?"#EBF4FF":isSun?"#FFF0EE":isSat?"#EBF4FF":"#FAFBFC",borderBottom:"1px solid #E2E8F0",gap:10}}>
+        <div>
+          <div style={{display:"flex",alignItems:"center",gap:6}}>
+            <div style={{fontSize:22,fontWeight:700,lineHeight:1,color:absent?"#E85D4A":isToday?"#4A90D9":isSun?"#E85D4A":isSat?"#4A90D9":"#1A1A2E"}}>{day}</div>
+            {isToday&&!absent&&<span style={{fontSize:10,fontWeight:700,background:"#4A90D9",color:"white",borderRadius:20,padding:"1px 7px"}}>今日</span>}
+            {absent&&<span style={{fontSize:10,fontWeight:700,background:"#E85D4A",color:"white",borderRadius:20,padding:"1px 7px"}}>欠勤</span>}
+            {isEarlyLeave&&<span style={{fontSize:10,fontWeight:700,background:"#F0A500",color:"white",borderRadius:20,padding:"1px 7px"}}>勤務解消</span>}
+            {isLeaveEarly&&<span style={{fontSize:10,fontWeight:700,background:"#7A5AF8",color:"white",borderRadius:20,padding:"1px 7px"}}>早退</span>}
+          </div>
+          <div style={{fontSize:11,fontWeight:500,color:"#7A8BA8"}}>{DOW_JP[dow]||dow}曜日</div>
+        </div>
+        <div style={{marginLeft:"auto",display:"flex",alignItems:"center",gap:6,flexWrap:"wrap",justifyContent:"flex-end"}}>
+          {!dayOff&&<>
+            <span style={{fontSize:13,fontWeight:700,color:"#1B2A4A",background:"#EBF4FF",padding:"3px 10px",borderRadius:20}}>勤務 {fmtDur(workMin)}</span>
+            {breakMin>0&&<span style={{fontSize:12,fontWeight:700,padding:"3px 10px",borderRadius:20,background:hasFullBreak?"#FFF3CD":"#F4F6F9",color:hasFullBreak?"#92600A":"#7A8BA8",border:hasFullBreak?"1px solid #F0C040":"1px solid #E2E8F0"}}>休{fmtBreak(breakMin)}</span>}
+            {isEarlyLeave&&earlyLeaveWorkMin>0&&<span style={{fontSize:12,fontWeight:700,padding:"3px 10px",borderRadius:20,background:"#FFF9E6",color:"#92600A",border:"1px solid #F0C040"}}>勤解 {fmtDur(earlyLeaveWorkMin)}</span>}
+            {wage>0&&<span style={{fontSize:12,fontWeight:700,color:"#3DAA6B",background:"#EDFAF4",padding:"3px 10px",borderRadius:20}}>¥{dailyWage.toLocaleString()}</span>}
+          </>}
+          {dayOff&&<span style={{fontSize:13,fontWeight:700,color:absent?"#E85D4A":"#7A8BA8",background:absent?"#FFF0EE":"#F4F6F9",padding:"3px 10px",borderRadius:20}}>{absent?"欠勤":"休日"}</span>}
+        </div>
+      </div>
+      {!dayOff&&<div style={{padding:"8px 14px"}}>
+        {shifts.map((sh,i)=>{
+          const shBreakMin=sh.breaks.reduce((s,b)=>s+(timeToMin(b.end)-timeToMin(b.start)),0);
+          return(
+            <div key={i} style={{display:"flex",gap:10,padding:"6px 0",borderTop:i>0?"1px dashed #E2E8F0":"none"}}>
+              <div style={{fontSize:13,fontWeight:700,color:"#1B2A4A",whiteSpace:"nowrap",minWidth:110}}>{sh.start} – {sh.end}</div>
+              <div style={{flex:1,display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
+                {shBreakMin>0&&<span style={{fontSize:11,color:"#7A8BA8"}}>休憩 {fmtBreak(shBreakMin)}</span>}
+                {sh.notes.length>0&&<span style={{fontSize:12,color:"#7A8BA8"}}>{sh.notes.join(" · ")}</span>}
+              </div>
+            </div>
+          );
+        })}
+        {isEarlyLeave&&(()=>{
+          const lm=timeToMin(override.earlyLeaveTime);
+          let remStart="",remEnd="";
+          for(const sh of shifts){const s=timeToMin(sh.start),e=timeToMin(sh.end);if(lm>s&&lm<e){remStart=override.earlyLeaveTime;remEnd=sh.end;}else if(lm<=s){remStart=sh.start;remEnd=sh.end;}}
+          const remMin=remStart&&remEnd?timeToMin(remEnd)-timeToMin(remStart):0;
+          const remWage=wage>0?Math.floor(wage*(earlyLeaveRate/100)*(remMin/60)):0;
+          return <div style={{marginTop:6,padding:"6px 10px",background:"#FFF9E6",borderRadius:8,fontSize:12,color:"#92600A",borderLeft:"3px solid #F0C040"}}>
+            ⚡ {override.earlyLeaveTime}に勤務解消　{remStart&&remEnd?`${remStart}–${remEnd} ${fmtDur(remMin)}${wage>0?" ¥"+remWage.toLocaleString():""}`:""}</div>;
+        })()}
+        {isLeaveEarly&&<div style={{marginTop:6,padding:"6px 10px",background:"#F0EEFF",borderRadius:8,fontSize:12,color:"#5B3FC4",borderLeft:"3px solid #7A5AF8"}}>
+          🚶 {override.leaveEarlyTime}に早退
+        </div>}
+      </div>}
+      {dayOff&&!absent&&<div style={{padding:"8px 14px"}}><div style={{fontSize:13,color:"#7A8BA8",padding:"4px 0"}}>🌿 お休み</div></div>}
+      {override.memo&&<div style={{padding:"4px 14px 10px",fontSize:12,color:"#5B3FC4",background:"#F8F5FF",borderTop:"1px solid #EDE8FF",lineHeight:1.5,display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical",overflow:"hidden"}}>📝 {override.memo}</div>}
+    </div>
+  );
+}
+
+function DayDetailPage({dayKey,dayData,onBack,onSave,earlyLeaveRate:defaultRate}){
+  const label=keyToLabel(dayKey);
+  const ov=dayData.override||{};
+  const[mode,setMode]=useState("detail");
+  const[shifts,setShifts]=useState(()=>JSON.parse(JSON.stringify(dayData.shifts||[])));
+  const[leaveTime,setLeaveTime]=useState(ov.earlyLeaveTime||"");
+  const[leaveEarlyTime,setLeaveEarlyTime]=useState(ov.leaveEarlyTime||"");
+  const[memo,setMemo]=useState(dayData.override&&dayData.override.memo||"");
+  const saveMemo=()=>{onSave(dayKey,{...dayData,override:{...(dayData.override||{}),memo:memo.trim()}});};
+  const{constraintMin,breakMin,workMin,earlyLeaveWorkMin}=calcDayTimes(dayData);
+  const absent=ov.absent;
+  const isEarlyLeave=!!(ov.earlyLeave&&ov.earlyLeaveTime);
+  const isLeaveEarly=!!(ov.leaveEarly&&ov.leaveEarlyTime);
+  const btnBase={border:"none",borderRadius:8,padding:"11px 0",fontSize:13,fontWeight:700,cursor:"pointer",width:"100%"};
+  const applyAbsent=()=>{onSave(dayKey,{...dayData,override:{...ov,absent:true,earlyLeave:false,leaveEarly:false}});onBack();};
+  const removeAbsent=()=>{const nOv={...ov};delete nOv.absent;onSave(dayKey,{...dayData,override:nOv});onBack();};
+  const applyEarlyLeave=()=>{if(!leaveTime){alert("解消時刻を入力してください");return;}onSave(dayKey,{...dayData,override:{...ov,earlyLeave:true,earlyLeaveTime:leaveTime,absent:false,leaveEarly:false}});onBack();};
+  const removeEarlyLeave=()=>{const nOv={...ov};delete nOv.earlyLeave;delete nOv.earlyLeaveTime;onSave(dayKey,{...dayData,override:nOv});onBack();};
+  const applyLeaveEarly=()=>{if(!leaveEarlyTime){alert("早退時刻を入力してください");return;}onSave(dayKey,{...dayData,override:{...ov,leaveEarly:true,leaveEarlyTime:leaveEarlyTime,absent:false,earlyLeave:false}});onBack();};
+  const removeLeaveEarly=()=>{const nOv={...ov};delete nOv.leaveEarly;delete nOv.leaveEarlyTime;onSave(dayKey,{...dayData,override:nOv});onBack();};
+  const saveShifts=()=>{const valid=shifts.filter(s=>s.start&&s.end&&timeToMin(s.end)>timeToMin(s.start));onSave(dayKey,{...dayData,shifts:valid});onBack();};
+  const updateShift=(i,field,val)=>{const s=[...shifts];s[i]={...s[i],[field]:val};if(field==="start"||field==="end"){const st=timeToMin(s[i].start||"0:00"),en=timeToMin(s[i].end||"0:00");if(en>st)s[i].minutes=en-st-s[i].breaks.reduce((t,b)=>t+(timeToMin(b.end)-timeToMin(b.start)),0);}setShifts(s);};
+  const removeShift=(i)=>setShifts(shifts.filter((_,j)=>j!==i));
+  const addBreak=(i)=>{const s=[...shifts];s[i]={...s[i],breaks:[...s[i].breaks,{start:"12:00",end:"13:00",durationMin:60}]};setShifts(s);};
+  const updateBreakDur=(i,bi,durMin)=>{const s=[...shifts];const bs=[...s[i].breaks];const stMin=timeToMin(bs[bi].start||"12:00");const enMin=stMin+durMin;bs[bi]={...bs[bi],end:`${String(Math.floor(enMin/60)).padStart(2,"0")}:${String(enMin%60).padStart(2,"0")}`,durationMin:durMin};s[i]={...s[i],breaks:bs};setShifts(s);};
+  const removeBreak=(i,bi)=>{const s=[...shifts];s[i]={...s[i],breaks:s[i].breaks.filter((_,j)=>j!==bi)};setShifts(s);};
+  const inp={border:"2px solid #E2E8F0",borderRadius:8,padding:"8px 10px",fontSize:13,outline:"none",background:"white",color:"#1A1A2E",fontFamily:"inherit"};
+  const sec={background:"white",borderRadius:12,padding:20,boxShadow:"0 2px 12px rgba(27,42,74,0.08)",marginBottom:12};
+  return(
+    <div style={{fontFamily:"system-ui,sans-serif",background:"#F4F6F9",minHeight:"100vh"}}>
+      <div style={{background:"#1B2A4A",color:"white",padding:"14px 20px",display:"flex",alignItems:"center",gap:12,boxShadow:"0 2px 16px rgba(0,0,0,0.2)",position:"sticky",top:0,zIndex:100}}>
+        <button onClick={onBack} style={{background:"rgba(255,255,255,0.15)",border:"none",color:"white",width:32,height:32,borderRadius:"50%",cursor:"pointer",fontSize:18,display:"flex",alignItems:"center",justifyContent:"center"}}>←</button>
+        <div style={{fontSize:18,fontWeight:700}}>{label}</div>
+        {absent&&<span style={{fontSize:11,fontWeight:700,background:"#E85D4A",color:"white",borderRadius:20,padding:"2px 8px"}}>欠勤</span>}
+        {isEarlyLeave&&<span style={{fontSize:11,fontWeight:700,background:"#F0A500",color:"white",borderRadius:20,padding:"2px 8px"}}>勤務解消</span>}
+        {isLeaveEarly&&<span style={{fontSize:11,fontWeight:700,background:"#7A5AF8",color:"white",borderRadius:20,padding:"2px 8px"}}>早退</span>}
+      </div>
+      <div style={{padding:16,maxWidth:600,margin:"0 auto"}}>
+        {mode==="detail"&&<>
+          {!absent&&dayData.shifts.length>0&&<div style={sec}>
+            <div style={{fontSize:14,fontWeight:700,color:"#1B2A4A",marginBottom:12}}>勤務時間</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:isEarlyLeave?12:0}}>
+              {[["拘束",fmtDur(constraintMin),"#7A8BA8"],["休憩",fmtBreak(breakMin),"#92600A"],["勤務",fmtDur(workMin),"#4A90D9"]].map(([l,v,c])=>(
+                <div key={l} style={{background:"#F4F6F9",borderRadius:10,padding:"10px 8px",textAlign:"center"}}>
+                  <div style={{fontSize:11,color:"#7A8BA8",marginBottom:4}}>{l}</div>
+                  <div style={{fontSize:16,fontWeight:700,color:c}}>{v}</div>
+                </div>
+              ))}
+            </div>
+            {isEarlyLeave&&(()=>{
+              const lm=timeToMin(ov.earlyLeaveTime);
+              let remStart="",remEnd="";
+              for(const sh of dayData.shifts){const s=timeToMin(sh.start),e=timeToMin(sh.end);if(lm>s&&lm<e){remStart=ov.earlyLeaveTime;remEnd=sh.end;}else if(lm<=s){remStart=sh.start;remEnd=sh.end;}}
+              const remMin=remStart&&remEnd?timeToMin(remEnd)-timeToMin(remStart):0;
+              return <div style={{padding:"8px 12px",background:"#FFF9E6",borderRadius:8,fontSize:12,color:"#92600A",borderLeft:"3px solid #F0C040",marginTop:12}}>
+                ⚡ {ov.earlyLeaveTime}に勤務解消　{remStart&&remEnd?`${remStart}–${remEnd} ${fmtDur(remMin)}`:""}
+              </div>;
+            })()}
+            {isLeaveEarly&&<div style={{padding:"8px 12px",background:"#F0EEFF",borderRadius:8,fontSize:12,color:"#5B3FC4",borderLeft:"3px solid #7A5AF8",marginTop:12}}>
+              🚶 {ov.leaveEarlyTime}に早退
+            </div>}
+          </div>}
+          {!absent&&dayData.shifts.length>0&&<div style={sec}>
+            <div style={{fontSize:14,fontWeight:700,color:"#1B2A4A",marginBottom:12}}>シフト詳細</div>
+            {dayData.shifts.map((sh,i)=>(
+              <div key={i} style={{padding:"10px 0",borderTop:i>0?"1px dashed #E2E8F0":"none"}}>
+                <div style={{fontSize:14,fontWeight:700,color:"#1B2A4A"}}>{sh.start} – {sh.end} <span style={{fontSize:12,color:"#4A90D9",fontWeight:400}}>({fmtDur(sh.minutes)})</span></div>
+                {sh.breaks.length>0&&<div style={{fontSize:12,color:"#7A8BA8",marginTop:4}}>休憩 {fmtBreak(sh.breaks.reduce((s,b)=>s+(timeToMin(b.end)-timeToMin(b.start)),0))}</div>}
+                {sh.notes.map((n,j)=><div key={j} style={{fontSize:12,color:"#7A8BA8",marginTop:2}}>{n}</div>)}
+              </div>
+            ))}
+          </div>}
+          <div style={sec}>
+            <div style={{fontSize:14,fontWeight:700,color:"#1B2A4A",marginBottom:12}}>操作</div>
+            <div style={{display:"flex",flexDirection:"column",gap:8}}>
+              {<button onClick={()=>setMode("editShift")} style={{...btnBase,background:"#EBF4FF",color:"#4A90D9"}}>✏️ シフトを編集</button>}
+              {!isLeaveEarly?<button onClick={()=>setMode("leaveEarly")} style={{...btnBase,background:"#F0EEFF",color:"#5B3FC4"}}>🚶 早退を入力</button>:<button onClick={removeLeaveEarly} style={{...btnBase,background:"#F4F6F9",color:"#7A8BA8"}}>早退を取り消す</button>}
+              {!absent?<button onClick={()=>setMode("absent")} style={{...btnBase,background:"#FFF0EE",color:"#E85D4A"}}>欠勤にする</button>:<button onClick={removeAbsent} style={{...btnBase,background:"#EBF4FF",color:"#4A90D9"}}>欠勤を解除する</button>}
+              {!isEarlyLeave?<button onClick={()=>setMode("earlyLeave")} style={{...btnBase,background:"#FFF9E6",color:"#92600A"}}>⚡ 勤務解消を入力</button>:<button onClick={removeEarlyLeave} style={{...btnBase,background:"#F4F6F9",color:"#7A8BA8"}}>勤務解消を取り消す</button>}
+            </div>
+          </div>
+          <div style={sec}>
+            <div style={{fontSize:14,fontWeight:700,color:"#1B2A4A",marginBottom:10}}>メモ</div>
+            <textarea value={memo} onChange={e=>setMemo(e.target.value)} onBlur={saveMemo} placeholder="メモを入力…" style={{width:"100%",height:80,border:"2px solid #E2E8F0",borderRadius:8,padding:10,fontSize:13,resize:"none",outline:"none",background:"#FAFBFC",color:"#1A1A2E",fontFamily:"inherit"}}/>
+            <div style={{fontSize:11,color:"#7A8BA8",marginTop:4}}>入力後フォーカスを外すと自動保存されます</div>
+          </div>
+        </>}
+        {mode==="editShift"&&<>
+          <div style={sec}>
+            <div style={{fontSize:14,fontWeight:700,color:"#1B2A4A",marginBottom:16}}>シフトを編集</div>
+            {shifts.length===0&&<div style={{fontSize:13,color:"#7A8BA8",marginBottom:12}}>シフトがありません。追加してください。</div>}
+            {shifts.map((sh,i)=>(
+              <div key={i} style={{marginBottom:16,padding:14,background:"#F4F6F9",borderRadius:10}}>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
+                  <div><div style={{fontSize:11,color:"#7A8BA8",marginBottom:4,fontWeight:700}}>開始</div><input type="time" value={sh.start} onChange={e=>updateShift(i,"start",e.target.value)} style={{...inp,width:"100%"}}/></div>
+                  <div><div style={{fontSize:11,color:"#7A8BA8",marginBottom:4,fontWeight:700}}>終了</div><input type="time" value={sh.end} onChange={e=>updateShift(i,"end",e.target.value)} style={{...inp,width:"100%"}}/></div>
+                </div>
+                {sh.breaks.length>0&&<div style={{fontSize:11,color:"#7A8BA8",marginBottom:4,fontWeight:700}}>休憩</div>}
+                {sh.breaks.map((b,bi)=>{
+                  const durMin=b.durationMin||(b.start&&b.end?timeToMin(b.end)-timeToMin(b.start):60);
+                  return(
+                    <div key={bi} style={{display:"flex",gap:6,marginBottom:6,alignItems:"center"}}>
+                      <input type="number" value={durMin} min="1" max="480" onChange={e=>updateBreakDur(i,bi,parseInt(e.target.value)||0)} style={{...inp,width:80}} placeholder="分"/>
+                      <span style={{fontSize:12,color:"#7A8BA8"}}>分</span>
+                      <button onClick={()=>removeBreak(i,bi)} style={{background:"#FFF0EE",border:"none",color:"#E85D4A",borderRadius:6,padding:"8px 10px",cursor:"pointer",fontSize:12,fontWeight:700}}>削除</button>
+                    </div>
+                  );
+                })}
+                <div style={{display:"flex",gap:8,marginTop:4,flexWrap:"wrap"}}>
+                  <button onClick={()=>addBreak(i)} style={{fontSize:12,background:"white",border:"2px dashed #CBD5E0",color:"#7A8BA8",borderRadius:6,padding:"5px 10px",cursor:"pointer"}}>+ 休憩追加</button>
+                  <button onClick={()=>removeShift(i)} style={{fontSize:12,background:"#FFF0EE",border:"none",color:"#E85D4A",borderRadius:6,padding:"5px 12px",cursor:"pointer",fontWeight:700}}>このシフトを削除</button>
+                </div>
+              </div>
+            ))}
+          </div>
+          <button onClick={()=>setShifts(s=>[...s,{start:"09:00",end:"18:00",minutes:480,breaks:[],notes:[]}])} style={{...btnBase,background:"#F4F6F9",color:"#1B2A4A",marginBottom:10}}>+ シフトを追加</button>
+          <div style={{display:"flex",gap:10}}>
+            <button onClick={()=>setMode("detail")} style={{...btnBase,background:"#F4F6F9",color:"#7A8BA8",flex:1}}>キャンセル</button>
+            <button onClick={saveShifts} style={{...btnBase,background:"#1B2A4A",color:"white",flex:2}}>保存</button>
+          </div>
+        </>}
+        {mode==="absent"&&<div style={sec}>
+          <div style={{fontSize:14,fontWeight:700,color:"#E85D4A",marginBottom:8}}>欠勤にする</div>
+          <div style={{fontSize:13,color:"#7A8BA8",marginBottom:16,lineHeight:1.7}}>{label} を欠勤として記録します。<br/>勤務時間・給与の目安は0として計算されます。</div>
+          <div style={{display:"flex",gap:10}}>
+            <button onClick={()=>setMode("detail")} style={{...btnBase,background:"#F4F6F9",color:"#7A8BA8",flex:1}}>キャンセル</button>
+            <button onClick={applyAbsent} style={{...btnBase,background:"#E85D4A",color:"white",flex:2}}>欠勤として記録</button>
+          </div>
+        </div>}
+        {mode==="earlyLeave"&&<div style={sec}>
+          <div style={{fontSize:14,fontWeight:700,color:"#92600A",marginBottom:12}}>⚡ 勤務解消を入力</div>
+          <div style={{marginBottom:12}}><div style={{fontSize:12,fontWeight:700,color:"#7A8BA8",marginBottom:6}}>解消時刻</div><input type="time" value={leaveTime} onChange={e=>setLeaveTime(e.target.value)} style={{...inp,width:"100%"}}/></div>
+          <div style={{fontSize:11,color:"#7A8BA8",marginBottom:12}}>解消後の給与割合は設定画面で変更できます（現在: {defaultRate}%）</div>
+          {leaveTime&&(()=>{
+            const lm=timeToMin(leaveTime);
+            let remStart="",remEnd="";
+            for(const sh of dayData.shifts){const s=timeToMin(sh.start),e=timeToMin(sh.end);if(lm>s&&lm<e){remStart=leaveTime;remEnd=sh.end;}else if(lm<=s){remStart=sh.start;remEnd=sh.end;}}
+            const remMin=remStart&&remEnd?timeToMin(remEnd)-timeToMin(remStart):0;
+            return <div style={{padding:"10px 14px",background:"#FFF9E6",borderRadius:8,fontSize:12,color:"#92600A",marginBottom:16,lineHeight:1.8,borderLeft:"3px solid #F0C040"}}>
+              ⚡ {leaveTime}に勤務解消{remStart&&remEnd?`　${remStart}–${remEnd} ${fmtDur(remMin)}`:""}
+            </div>;
+          })()}
+          <div style={{display:"flex",gap:10}}>
+            <button onClick={()=>setMode("detail")} style={{...btnBase,background:"#F4F6F9",color:"#7A8BA8",flex:1}}>キャンセル</button>
+            <button onClick={applyEarlyLeave} style={{...btnBase,background:"#F0A500",color:"white",flex:2}}>記録する</button>
+          </div>
+        </div>}
+        {mode==="leaveEarly"&&<div style={sec}>
+          <div style={{fontSize:14,fontWeight:700,color:"#5B3FC4",marginBottom:12}}>🚶 早退を入力</div>
+          <div style={{marginBottom:12}}><div style={{fontSize:12,fontWeight:700,color:"#7A8BA8",marginBottom:6}}>早退時刻</div><input type="time" value={leaveEarlyTime} onChange={e=>setLeaveEarlyTime(e.target.value)} style={{...inp,width:"100%"}}/></div>
+          {leaveEarlyTime&&<div style={{padding:"10px 14px",background:"#F0EEFF",borderRadius:8,fontSize:12,color:"#5B3FC4",marginBottom:16,lineHeight:1.8,borderLeft:"3px solid #7A5AF8"}}>
+            🚶 {leaveEarlyTime}に早退<br/>給与は早退時刻までの勤務時間で計算されます
+          </div>}
+          <div style={{display:"flex",gap:10}}>
+            <button onClick={()=>setMode("detail")} style={{...btnBase,background:"#F4F6F9",color:"#7A8BA8",flex:1}}>キャンセル</button>
+            <button onClick={applyLeaveEarly} style={{...btnBase,background:"#7A5AF8",color:"white",flex:2}}>記録する</button>
+          </div>
+        </div>}
+      </div>
+    </div>
+  );
+}
+
+function ShiftChangePage({shiftData,calYear,calMonth,onBack}){
+  const myKeys=Object.keys(shiftData).filter(k=>k.startsWith(`${calYear}-${String(calMonth).padStart(2,"0")}`)).sort();
+  const[myKey,setMyKey]=useState("");const[otherKey,setOtherKey]=useState("");const[otherIsOff,setOtherIsOff]=useState(false);const[otherStart,setOtherStart]=useState("");const[otherEnd,setOtherEnd]=useState("");
+  const result=(()=>{
+    if(!myKey||!otherKey)return null;
+    const myOrigMin=calcDayTimes(shiftData[myKey]).workMin,myOrigIsOff=isOff(shiftData,myKey);
+    const otherMin=(()=>{if(otherIsOff)return 0;if(!otherStart||!otherEnd)return null;const diff=timeToMin(otherEnd)-timeToMin(otherStart);return diff>0?diff:null;})();
+    if(otherMin===null)return null;
+    const prefix=`${calYear}-${String(calMonth).padStart(2,"0")}`;
+    const beforeTotal=Object.keys(shiftData).filter(k=>k.startsWith(prefix)).reduce((s,k)=>s+calcDayTimes(shiftData[k]).workMin,0);
+    const myOrigShiftStr=myOrigIsOff?"休日":(!shiftData[myKey]||!shiftData[myKey].shifts.length)?"休日":shiftData[myKey].shifts.map(s=>`${s.start}–${s.end}`).join(" / ");
+    return{myLabel:keyToLabel(myKey),otherLabel:keyToLabel(otherKey),myOrigShiftStr,otherMin,otherIsOff,otherShiftStr:otherIsOff?"休日":`${otherStart}–${otherEnd}`,beforeTotal,afterTotal:beforeTotal-myOrigMin+otherMin,streakBefore:calcStreak(shiftData,myKey,null),streakAfter:calcStreak(shiftData,myKey,otherMin>0)};
+  })();
+  const inp={border:"2px solid #E2E8F0",borderRadius:8,padding:"8px 12px",fontSize:13,outline:"none",background:"white",color:"#1A1A2E",fontFamily:"inherit",width:"100%"};
+  const sec={background:"white",borderRadius:12,padding:20,boxShadow:"0 2px 12px rgba(27,42,74,0.08)",marginBottom:16};
+  const lbl={fontSize:12,fontWeight:700,color:"#7A8BA8",marginBottom:6,display:"block"};
+  return(
+    <div style={{fontFamily:"system-ui,sans-serif",background:"#F4F6F9",minHeight:"100vh"}}>
+      <div style={{background:"#1B2A4A",color:"white",padding:"14px 20px",display:"flex",alignItems:"center",gap:12,boxShadow:"0 2px 16px rgba(0,0,0,0.2)",position:"sticky",top:0,zIndex:100}}>
+        <button onClick={onBack} style={{background:"rgba(255,255,255,0.15)",border:"none",color:"white",width:32,height:32,borderRadius:"50%",cursor:"pointer",fontSize:18,display:"flex",alignItems:"center",justifyContent:"center"}}>←</button>
+        <div style={{fontSize:18,fontWeight:700}}>シフトチェンジ申請</div>
+      </div>
+      <div style={{padding:16,maxWidth:600,margin:"0 auto"}}>
+        <div style={sec}>
+          <div style={{fontSize:14,fontWeight:700,color:"#1B2A4A",marginBottom:14,display:"flex",alignItems:"center",gap:8}}><span style={{background:"#EBF4FF",color:"#4A90D9",borderRadius:20,padding:"2px 10px",fontSize:12}}>自分</span>交換するシフト</div>
+          <label style={lbl}>日付を選択</label>
+          <select value={myKey} onChange={e=>setMyKey(e.target.value)} style={{...inp,cursor:"pointer"}}>
+            <option value="">-- 日付を選んでください --</option>
+            {myKeys.map(k=><option key={k} value={k}>{keyToLabel(k)}　{isOff(shiftData,k)?"休日":shiftData[k].shifts.map(s=>`${s.start}–${s.end}`).join(" / ")}</option>)}
+          </select>
+          {myKey&&<div style={{marginTop:10,padding:"10px 14px",background:"#F4F6F9",borderRadius:8,fontSize:13}}><span style={{color:"#7A8BA8"}}>現在のシフト：</span><strong style={{color:"#1B2A4A"}}>{isOff(shiftData,myKey)?"休日":shiftData[myKey].shifts.map(s=>`${s.start}–${s.end}(${fmtDur(s.minutes)})`).join(" / ")}</strong></div>}
+        </div>
+        <div style={sec}>
+          <div style={{fontSize:14,fontWeight:700,color:"#1B2A4A",marginBottom:14,display:"flex",alignItems:"center",gap:8}}><span style={{background:"#FFF0EE",color:"#E85D4A",borderRadius:20,padding:"2px 10px",fontSize:12}}>相手</span>交換してもらうシフト</div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:12}}>
+            <div><label style={lbl}>日付（例: 6/4）</label><input type="text" placeholder="6/4" value={otherKey} onChange={e=>{const v=e.target.value.trim(),m2=v.match(/^(\d{1,2})\/(\d{1,2})$/);if(m2)setOtherKey(`${calYear}-${String(parseInt(m2[1])).padStart(2,"0")}-${String(parseInt(m2[2])).padStart(2,"0")}`);else setOtherKey(v);}} style={inp}/></div>
+            <div style={{display:"flex",flexDirection:"column",justifyContent:"flex-end"}}><label style={{...lbl,display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}><input type="checkbox" checked={otherIsOff} onChange={e=>setOtherIsOff(e.target.checked)} style={{width:16,height:16}}/>休日と交換</label></div>
+          </div>
+          {!otherIsOff&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+            <div><label style={lbl}>開始時間</label><input type="time" value={otherStart} onChange={e=>setOtherStart(e.target.value)} style={inp}/></div>
+            <div><label style={lbl}>終了時間</label><input type="time" value={otherEnd} onChange={e=>setOtherEnd(e.target.value)} style={inp}/></div>
+          </div>}
+        </div>
+        {result?(
+          <div style={{background:"white",borderRadius:12,boxShadow:"0 2px 12px rgba(27,42,74,0.08)",overflow:"hidden"}}>
+            <div style={{background:"#1B2A4A",color:"white",padding:"12px 20px",fontSize:14,fontWeight:700}}>書類記入内容</div>
+            <div style={{padding:20}}>
+              {[{label:"自分のシフト（交換するシフト）",before:`${result.myLabel}　${result.myOrigShiftStr}`,after:`${result.otherLabel}　${result.otherShiftStr}`,icon:"👤"},{label:"相手のシフト（受け取るシフト）",before:`${result.otherLabel}　${result.otherShiftStr}`,after:`${result.myLabel}　${result.myOrigShiftStr}`,icon:"👥"}].map((row,i)=>(
+                <div key={i} style={{padding:"14px 0",borderBottom:"1px solid #F0F4F8"}}>
+                  <div style={{fontSize:11,fontWeight:700,color:"#7A8BA8",marginBottom:8}}>{row.icon} {row.label}</div>
+                  <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+                    <span style={{fontSize:14,fontWeight:700,color:"#1B2A4A",background:"#F4F6F9",padding:"4px 12px",borderRadius:8}}>{row.before}</span>
+                    <span style={{color:"#7A8BA8",fontSize:18}}>→</span>
+                    <span style={{fontSize:14,fontWeight:700,color:"white",background:"#4A90D9",padding:"4px 12px",borderRadius:8}}>{row.after}</span>
+                  </div>
+                </div>
+              ))}
+              <div style={{padding:"14px 0",borderBottom:"1px solid #F0F4F8"}}>
+                <div style={{fontSize:11,fontWeight:700,color:"#7A8BA8",marginBottom:8}}>連勤数（自分）</div>
+                <div style={{display:"flex",alignItems:"center",gap:10}}>
+                  <span style={{fontSize:15,fontWeight:700,color:"#1B2A4A",background:"#F4F6F9",padding:"4px 14px",borderRadius:8}}>{result.streakBefore===0?"休日":`${result.streakBefore}連勤`}</span>
+                  <span style={{color:"#7A8BA8",fontSize:18}}>→</span>
+                  <span style={{fontSize:15,fontWeight:700,padding:"4px 14px",borderRadius:8,background:result.streakAfter>=5?"#FFF0EE":result.streakAfter===0?"#F4F6F9":"#EBF4FF",color:result.streakAfter>=5?"#E85D4A":result.streakAfter===0?"#7A8BA8":"#1B2A4A"}}>{result.streakAfter===0?"休日":`${result.streakAfter}連勤`}</span>
+                  {result.streakAfter>=5&&<span style={{fontSize:12,color:"#E85D4A"}}>⚠️ 注意</span>}
+                </div>
+              </div>
+              <div style={{padding:"14px 0"}}>
+                <div style={{fontSize:11,fontWeight:700,color:"#7A8BA8",marginBottom:8}}>月合計勤務時間</div>
+                <div style={{display:"flex",alignItems:"center",gap:10}}>
+                  <span style={{fontSize:15,fontWeight:700,color:"#1B2A4A",background:"#F4F6F9",padding:"4px 14px",borderRadius:8}}>{fmtDur(result.beforeTotal)}</span>
+                  <span style={{color:"#7A8BA8",fontSize:18}}>→</span>
+                  <span style={{fontSize:15,fontWeight:700,color:"white",padding:"4px 14px",borderRadius:8,background:result.afterTotal>result.beforeTotal?"#3DAA6B":result.afterTotal<result.beforeTotal?"#E85D4A":"#7A8BA8"}}>{fmtDur(result.afterTotal)}</span>
+                  <span style={{fontSize:13,color:"#7A8BA8"}}>({result.afterTotal>=result.beforeTotal?"+":""}{fmtDur(result.afterTotal-result.beforeTotal)})</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        ):(
+          <div style={{textAlign:"center",padding:"32px 20px",color:"#7A8BA8",background:"white",borderRadius:12,boxShadow:"0 2px 12px rgba(27,42,74,0.08)"}}>
+            <div style={{fontSize:36,marginBottom:10}}>↔</div>
+            <p style={{fontSize:13,lineHeight:1.7}}>自分の日付と相手のシフト情報を<br/>入力すると書類記入内容が表示されます</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SettingsPage({onBack,onSave,onImport}){
+  const saved=loadSettings();
+  const[eventName,setEventName]=useState(saved.eventName||"");
+  const[hourlyWage,setHourlyWage]=useState(String(saved.hourlyWage||""));
+  const[showWage,setShowWage]=useState(saved.showWage!==false);
+  const[earlyLeaveRate,setEarlyLeaveRate]=useState(String(saved.earlyLeaveRate||60));
+  const[importText,setImportText]=useState("");
+  const[importMsg,setImportMsg]=useState("");
+  const handleExport=()=>{try{const data=localStorage.getItem(STORAGE_KEY)||"{}";navigator.clipboard.writeText(data).then(()=>setImportMsg("✓ クリップボードにコピーしました")).catch(()=>setImportMsg("コピーできませんでした"));}catch{setImportMsg("エクスポートに失敗しました");}};
+  const handleImportData=()=>{if(!importText.trim())return;try{const parsed=JSON.parse(importText.trim());if(typeof parsed!=="object"||Array.isArray(parsed))throw new Error();localStorage.setItem(STORAGE_KEY,JSON.stringify(parsed));onImport(parsed);setImportMsg("✓ インポート完了！");setImportText("");}catch{setImportMsg("データの形式が正しくありません");}};
+  const handleSave=()=>{const next={eventName:eventName.trim(),hourlyWage:hourlyWage.trim(),showWage,earlyLeaveRate:parseInt(earlyLeaveRate)||60};saveSettings(next);onSave(next);onBack();};
+  const inp={border:"2px solid #E2E8F0",borderRadius:8,padding:"10px 12px",fontSize:14,outline:"none",background:"white",color:"#1A1A2E",fontFamily:"inherit",width:"100%"};
+  const lbl={fontSize:12,fontWeight:700,color:"#7A8BA8",marginBottom:6,display:"block"};
+  const sec={background:"white",borderRadius:12,padding:20,boxShadow:"0 2px 12px rgba(27,42,74,0.08)",marginBottom:16};
+  return(
+    <div style={{fontFamily:"system-ui,sans-serif",background:"#F4F6F9",minHeight:"100vh"}}>
+      <div style={{background:"#1B2A4A",color:"white",padding:"14px 20px",display:"flex",alignItems:"center",gap:12,boxShadow:"0 2px 16px rgba(0,0,0,0.2)",position:"sticky",top:0,zIndex:100}}>
+        <button onClick={onBack} style={{background:"rgba(255,255,255,0.15)",border:"none",color:"white",width:32,height:32,borderRadius:"50%",cursor:"pointer",fontSize:18,display:"flex",alignItems:"center",justifyContent:"center"}}>←</button>
+        <div style={{fontSize:18,fontWeight:700}}>設定</div>
+      </div>
+      <div style={{padding:16,maxWidth:600,margin:"0 auto"}}>
+        <div style={sec}>
+          <div style={{fontSize:14,fontWeight:700,color:"#1B2A4A",marginBottom:16}}>給料の目安</div>
+          <label style={lbl}>時給（円）</label>
+          <input type="number" placeholder="例: 1200" value={hourlyWage} onChange={e=>setHourlyWage(e.target.value)} style={{...inp,marginBottom:16}} min="0"/>
+          <label style={lbl}>勤務解消後の給与割合（%）</label>
+          <input type="number" placeholder="60" value={earlyLeaveRate} onChange={e=>setEarlyLeaveRate(e.target.value)} min="0" max="100" style={{...inp,marginBottom:16}}/>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+            <div><div style={{fontSize:13,fontWeight:600,color:"#1A1A2E"}}>給料表示</div><div style={{fontSize:12,color:"#7A8BA8",marginTop:2}}>statsバーに基本給の目安を表示する</div></div>
+            <button onClick={()=>setShowWage(v=>!v)} style={{width:48,height:26,borderRadius:13,border:"none",cursor:"pointer",position:"relative",background:showWage?"#4A90D9":"#CBD5E0",transition:"background 0.2s",flexShrink:0}}>
+              <div style={{position:"absolute",top:3,left:showWage?24:3,width:20,height:20,borderRadius:"50%",background:"white",transition:"left 0.2s",boxShadow:"0 1px 4px rgba(0,0,0,0.2)"}}/>
+            </button>
+          </div>
+        </div>
+        <div style={sec}>
+          <div style={{fontSize:14,fontWeight:700,color:"#1B2A4A",marginBottom:4}}>カレンダー書き出し</div>
+          <div style={{fontSize:12,color:"#7A8BA8",marginBottom:16}}>イベント名を統一する場合は入力してください</div>
+          <label style={lbl}>イベント名</label>
+          <input type="text" placeholder="例: 勤務、仕事、バイト" value={eventName} onChange={e=>setEventName(e.target.value)} style={inp}/>
+          <div style={{fontSize:12,color:"#7A8BA8",marginTop:8,lineHeight:1.6}}>空欄の場合はシフトの仕事内容がイベント名になります。</div>
+        </div>
+        <div style={sec}>
+          <div style={{fontSize:14,fontWeight:700,color:"#1B2A4A",marginBottom:4}}>データのバックアップ</div>
+          <div style={{fontSize:12,color:"#7A8BA8",marginBottom:16,lineHeight:1.6}}>機種変更や再インストール時に使用します</div>
+          <button onClick={handleExport} style={{width:"100%",background:"#EBF4FF",color:"#4A90D9",border:"2px solid #4A90D9",padding:"11px 0",borderRadius:8,fontSize:13,fontWeight:700,cursor:"pointer",marginBottom:10}}>データをエクスポート（クリップボードにコピー）</button>
+          <textarea value={importText} onChange={e=>setImportText(e.target.value)} placeholder="エクスポートしたデータをここに貼り付け…" style={{width:"100%",height:80,border:"2px solid #E2E8F0",borderRadius:8,padding:10,fontSize:11,fontFamily:"monospace",resize:"none",outline:"none",background:"#FAFBFC",color:"#1A1A2E",marginBottom:8}}/>
+          <button onClick={handleImportData} style={{width:"100%",background:importText.trim()?"#1B2A4A":"#CBD5E0",color:"white",border:"none",padding:"11px 0",borderRadius:8,fontSize:13,fontWeight:700,cursor:importText.trim()?"pointer":"default"}}>インポートして復元</button>
+          {importMsg&&<div style={{fontSize:12,marginTop:8,color:importMsg.includes("✓")?"#3DAA6B":"#E85D4A",fontWeight:600}}>{importMsg}</div>}
+        </div>
+        <button onClick={handleSave} style={{width:"100%",background:"#1B2A4A",color:"white",border:"none",padding:"13px 0",borderRadius:10,fontSize:14,fontWeight:700,cursor:"pointer"}}>保存</button>
+      </div>
+    </div>
+  );
+}
+
+function App(){
+  const[page,setPage]=useState("calendar");
+  const[detailKey,setDetailKey]=useState(null);
+  const[input,setInput]=useState("");
+  const[shiftData,setShiftData]=useState(()=>{try{const s=localStorage.getItem(STORAGE_KEY);return s?JSON.parse(s):{};}catch{return{};}});
+  const[settings,setSettings]=useState(loadSettings);
+  const[year,setYear]=useState(new Date().getFullYear());
+  const[month,setMonth]=useState(new Date().getMonth()+1);
+  const[toast,setToast]=useState("");
+  useEffect(()=>{try{localStorage.setItem(STORAGE_KEY,JSON.stringify(shiftData));}catch{}},[shiftData]);
+  const showToast=(msg)=>{setToast(msg);setTimeout(()=>setToast(""),2400);};
+  const handleImportShift=useCallback(()=>{
+    if(!input.trim()){showToast("シフトを貼り付けてください");return;}
+    const parsed=parseShift(input);const count=Object.keys(parsed).length;
+    if(count===0){showToast("シフトが読み取れませんでした");return;}
+    setShiftData(prev=>({...prev,...parsed}));
+    const firstKey=Object.keys(parsed).sort()[0];
+    if(firstKey){setYear(parseInt(firstKey.split("-")[0]));setMonth(parseInt(firstKey.split("-")[1]));}
+    showToast(`${count}日分を読み込みました ✓`);
+  },[input]);
+  const handleClear=()=>{const prefix=`${year}-${String(month).padStart(2,"0")}`;setShiftData(prev=>{const n={...prev};Object.keys(n).forEach(k=>{if(k.startsWith(prefix))delete n[k];});return n;});setInput("");showToast("クリアしました");};
+  const handleExportICS=()=>{const prefix=`${year}-${String(month).padStart(2,"0")}`;if(!Object.keys(shiftData).some(k=>k.startsWith(prefix)&&!isOff(shiftData,k))){showToast("この月の勤務データがありません");return;}downloadICS(shiftData,year,month,settings.eventName);showToast("カレンダーファイルをダウンロードしました");};
+  const handleSaveDay=(key,newData)=>setShiftData(prev=>({...prev,[key]:newData}));
+  const prevMonth=()=>{if(month===1){setMonth(12);setYear(y=>y-1);}else setMonth(m=>m-1);};
+  const nextMonth=()=>{if(month===12){setMonth(1);setYear(y=>y+1);}else setMonth(m=>m+1);};
+  const todayKey=dateToKey(new Date());
+  const prefix=`${year}-${String(month).padStart(2,"0")}`;
+  const days=Object.entries(shiftData).filter(([k])=>k.startsWith(prefix)).sort(([a],[b])=>a.localeCompare(b));
+  const workDays=days.filter(([,d])=>!d.isOff&&d.shifts.length>0&&!(d.override&&d.override.absent));
+  const totalWorkMin=workDays.reduce((s,[,d])=>s+calcDayTimes(d).workMin,0);
+  const totalConstraintMin=workDays.reduce((s,[,d])=>s+calcDayTimes(d).constraintMin,0);
+  const totalBreakMin=workDays.reduce((s,[,d])=>s+calcDayTimes(d).breakMin,0);
+  const wage=settings.hourlyWage?parseInt(settings.hourlyWage):0;
+  const earlyLeaveRate=settings.earlyLeaveRate||60;
+  const estWage=wage>0?workDays.reduce((s,[,d])=>s+calcDayWage(d,wage,earlyLeaveRate),0):0;
+  if(page==="swap")return <ShiftChangePage shiftData={shiftData} calYear={year} calMonth={month} onBack={()=>setPage("calendar")}/>;
+  if(page==="settings")return <SettingsPage onBack={()=>setPage("calendar")} onSave={setSettings} onImport={d=>{setShiftData(d);setPage("calendar");}}/>;
+  if(page==="dayDetail"&&detailKey&&shiftData[detailKey])return <DayDetailPage dayKey={detailKey} dayData={shiftData[detailKey]} onBack={()=>setPage("calendar")} onSave={handleSaveDay} earlyLeaveRate={earlyLeaveRate}/>;
+  const IconSwap=()=>(<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M1 6h11M9 3l3 3-3 3M15 10H4M6 7l-3 3 3 3"/></svg>);
+  const IconCal=()=>(<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="1" y="3" width="14" height="12" rx="2"/><path d="M5 1v4M11 1v4M1 7h14M8 10v4M6 12l2 2 2-2"/></svg>);
+  const IconSettings=()=>(<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="8" cy="8" r="2.5"/><path d="M8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15M3.05 3.05l1.06 1.06M11.89 11.89l1.06 1.06M3.05 12.95l1.06-1.06M11.89 4.11l1.06-1.06"/></svg>);
+  return(
+    <div style={{fontFamily:"system-ui,sans-serif",background:"#F4F6F9",minHeight:"100vh"}}>
+      <div style={{background:"#1B2A4A",color:"white",padding:"14px 20px",display:"flex",alignItems:"center",justifyContent:"space-between",boxShadow:"0 2px 16px rgba(0,0,0,0.2)",position:"sticky",top:0,zIndex:100}}>
+        <div style={{fontSize:18,fontWeight:700}}>シフトカレンダー</div>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <button onClick={()=>setPage("settings")} style={{background:"rgba(255,255,255,0.15)",border:"none",color:"white",width:30,height:30,borderRadius:"50%",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}><IconSettings/></button>
+          <button onClick={prevMonth} style={{background:"rgba(255,255,255,0.15)",border:"none",color:"white",width:30,height:30,borderRadius:"50%",cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center"}}>‹</button>
+          <span style={{fontSize:14,fontWeight:500,minWidth:76,textAlign:"center"}}>{year}年{month}月</span>
+          <button onClick={nextMonth} style={{background:"rgba(255,255,255,0.15)",border:"none",color:"white",width:30,height:30,borderRadius:"50%",cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center"}}>›</button>
+        </div>
+      </div>
+      <div style={{background:"#2C3E62",color:"white",padding:"0 20px",display:"flex",alignItems:"stretch",minHeight:42,fontSize:13}}>
+        <div style={{display:"flex",alignItems:"center",gap:12,flex:1,paddingTop:10,paddingBottom:10,flexWrap:"wrap"}}>
+          <span><strong>{workDays.length}</strong>日出勤</span>
+          <span>勤務 <strong style={{fontSize:15,color:"#7EC8E3"}}>{fmtDur(totalWorkMin)}</strong></span>
+          {totalBreakMin>0&&<span>休憩 <strong style={{color:"#F0C040"}}>{fmtDur(totalBreakMin)}</strong></span>}
+          {settings.showWage!==false&&estWage>0&&<span>目安 <strong style={{fontSize:15,color:"#98E0B0"}}>¥{estWage.toLocaleString()}</strong></span>}
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:1,paddingLeft:12}}>
+          <button onClick={()=>setPage("swap")} style={{display:"flex",alignItems:"center",gap:5,background:"rgba(255,255,255,0.1)",border:"none",borderRight:"1px solid rgba(255,255,255,0.12)",color:"white",padding:"0 12px",height:"100%",cursor:"pointer",fontSize:12,fontWeight:600,borderRadius:"6px 0 0 6px",whiteSpace:"nowrap"}}><IconSwap/> シフトチェンジ</button>
+          <button onClick={handleExportICS} style={{display:"flex",alignItems:"center",gap:5,background:"rgba(255,255,255,0.1)",border:"none",color:"white",padding:"0 12px",height:"100%",cursor:"pointer",fontSize:12,fontWeight:600,borderRadius:"0 6px 6px 0",whiteSpace:"nowrap"}}><IconCal/> 書き出し</button>
+        </div>
+      </div>
+      <div style={{padding:16,maxWidth:640,margin:"0 auto"}}>
+        <div style={{background:"white",borderRadius:12,boxShadow:"0 2px 12px rgba(27,42,74,0.08)",padding:20,marginBottom:20}}>
+          <div style={{fontSize:14,fontWeight:700,color:"#1B2A4A",marginBottom:10}}>シフトを貼り付け</div>
+          <textarea value={input} onChange={e=>setInput(e.target.value)} placeholder="シフト文字列をここに貼り付けてください…" style={{width:"100%",height:110,border:"2px solid #E2E8F0",borderRadius:8,padding:12,fontFamily:"monospace",fontSize:12,resize:"vertical",outline:"none",background:"#FAFBFC",color:"#1A1A2E"}}/>
+          <div style={{display:"flex",gap:10,marginTop:10}}>
+            <button onClick={handleImportShift} style={{flex:1,background:"#1B2A4A",color:"white",border:"none",padding:"10px 0",borderRadius:8,fontSize:13,fontWeight:700,cursor:"pointer"}}>読み込む</button>
+            <button onClick={handleClear} style={{background:"transparent",color:"#7A8BA8",border:"2px solid #E2E8F0",padding:"10px 14px",borderRadius:8,fontSize:13,cursor:"pointer"}}>クリア</button>
+          </div>
+        </div>
+
+        {/* ── Month Calendar ── */}
+        {days.length>0&&(()=>{
+          const DOW_LABELS=["日","月","火","水","木","金","土"];
+          const firstDay=new Date(year,month-1,1).getDay();
+          const daysInMonth=new Date(year,month,0).getDate();
+          const cells=[];
+          for(let i=0;i<firstDay;i++)cells.push(null);
+          for(let d=1;d<=daysInMonth;d++)cells.push(d);
+          while(cells.length%7!==0)cells.push(null);
+          const dataMap={};
+          days.forEach(([k,v])=>{const d=parseInt(k.split("-")[2]);dataMap[d]=v;});
+          return(
+            <div style={{background:"white",borderRadius:12,boxShadow:"0 2px 12px rgba(27,42,74,0.08)",padding:"16px 12px",marginBottom:20}}>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",marginBottom:6}}>
+                {DOW_LABELS.map((d,i)=>(
+                  <div key={d} style={{textAlign:"center",fontSize:11,fontWeight:700,color:i===0?"#E85D4A":i===6?"#4A90D9":"#7A8BA8",paddingBottom:4}}>{d}</div>
+                ))}
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:3}}>
+                {cells.map((d,i)=>{
+                  if(!d) return <div key={`e${i}`}/>;
+                  const dayData=dataMap[d];
+                  const key=`${year}-${String(month).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
+                  const isToday2=key===todayKey;
+                  const dow=i%7;
+                  const absent=dayData&&dayData.override&&dayData.override.absent;
+                  const isOff2=!dayData||dayData.isOff||dayData.shifts.length===0||absent;
+                  const isEL=dayData&&dayData.override&&dayData.override.earlyLeave;
+                  const isLE=dayData&&dayData.override&&dayData.override.leaveEarly;
+                  const {workMin:wm}=dayData?calcDayTimes(dayData):{workMin:0};
+                  const bg=isToday2?"#4A90D9":absent?"#E85D4A":isEL?"#F0A500":isLE?"#7A5AF8":!isOff2?"#EBF4FF":"transparent";
+                  const fc=isToday2?"white":absent?"white":isEL?"white":isLE?"white":dow===0?"#E85D4A":dow===6?"#4A90D9":"#1A1A2E";
+                  const border=isToday2?"none":!isOff2?"1px solid #D4E8FF":"1px solid transparent";
+                  return(
+                    <div key={d} onClick={()=>{if(dayData){setDetailKey(key);setPage("dayDetail");}}} style={{borderRadius:8,padding:"5px 2px",textAlign:"center",background:bg,border,cursor:dayData?"pointer":"default",minHeight:52,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"flex-start",paddingTop:5}}>
+                      <div style={{fontSize:13,fontWeight:700,color:fc,lineHeight:1}}>{d}</div>
+                      {!isOff2&&wm>0&&<div style={{fontSize:9,color:isToday2?"rgba(255,255,255,0.9)":isEL||isLE?"white":"#4A90D9",marginTop:3,fontWeight:600,lineHeight:1}}>{fmtDur(wm)}</div>}
+                      {absent&&<div style={{fontSize:9,color:"white",marginTop:3,fontWeight:600}}>欠勤</div>}
+                      {isOff2&&!absent&&dayData&&<div style={{fontSize:9,color:"#CBD5E0",marginTop:3}}>休</div>}
+                      {wage>0&&!isOff2&&wm>0&&(()=>{const dw=calcDayWage(dayData,wage,earlyLeaveRate);return dw>0?<div style={{fontSize:8,color:isToday2?"rgba(255,255,255,0.8)":"#3DAA6B",marginTop:2,fontWeight:600}}>¥{dw>=10000?(dw/10000).toFixed(1)+"万":dw.toLocaleString()}</div>:null;})()}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })()}
+
+        <div style={{display:"flex",flexDirection:"column",gap:8}}>
+          {days.length===0
+            ?<div style={{textAlign:"center",padding:"48px 20px",color:"#7A8BA8"}}><div style={{fontSize:48,marginBottom:12}}>📅</div><p style={{fontSize:14,lineHeight:1.7}}>シフト文字列を貼り付けて<br/>「読み込む」を押してください。</p></div>
+            :days.map(([key,data])=><DayCard key={key} data={{...data,_key:key}} todayKey={todayKey} wage={settings.showWage!==false?wage:0} earlyLeaveRate={earlyLeaveRate} onClick={()=>{setDetailKey(key);setPage("dayDetail");}}/>)
+          }
+        </div>
+        <div style={{textAlign:"center",padding:"32px 20px 24px",color:"#C8D4E8",fontSize:12}}>
+          {(()=>{const msgs=["今月もお疲れ様でした。","いってらっしゃい。","楽しんできてくださいね♪","無理しすぎないでね。","今日もよく頑張りました。","ゆっくり休んでね。","いつもありがとう。","今日も一日お疲れ様。","気をつけていってきてね。","また明日も元気でね。"];return msgs[Math.floor(Math.random()*msgs.length)];})()}
+        </div>
+      </div>
+      {toast&&<div style={{position:"fixed",bottom:24,left:"50%",transform:"translateX(-50%)",background:"#1B2A4A",color:"white",padding:"10px 20px",borderRadius:24,fontSize:13,fontWeight:500,zIndex:200,boxShadow:"0 4px 16px rgba(0,0,0,0.2)"}}>{toast}</div>}
+    </div>
+  );
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+  </script>
+</body>
+</html>
